@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-달서별빛캠프 (camp.xticket.kr) 오토캠핑장 취소표(빈자리) 감시 스크립트
+달서별빛캠프 (camp.xticket.kr) 오토/데크캠핑장 취소표(빈자리) 감시 스크립트
 ------------------------------------------------------------------
 지정한 날짜 + 오토캠핑장으로 실제 클릭 조작을 재현한 뒤, 사이트 지도에
 표시되는 자리 아이콘의 alt 텍스트("예약완료" 포함 여부)로 상태를 판별합니다.
@@ -34,7 +34,12 @@ SHOP_URL = (
     "?shopEncode=f27ad3485cf140b64341e2cc975c376d14561a12aca07349ae393d97379882c7"
 )
 TARGET_DAY = "26"          # 체크인 날짜(일) - 달력에 보이는 "26" 클릭
-FACILITY_RADIO_ID = "오토캠핑장"   # 카라반 / 오토캠핑장 / 숲속캠핑장 / 데크캠핑장
+# 감시할 시설: (라디오 버튼 id, 자리 아이콘 alt에 들어가는 키워드)
+#   선택지: 카라반 / 오토캠핑장 / 숲속캠핑장 / 데크캠핑장
+FACILITIES = [
+    ("오토캠핑장", "오토캠핑"),
+    ("데크캠핑장", "데크"),
+]
 NTFY_TOPIC = "cmsoon123-camp0926-9f3a1"  # 공개 저장소이므로 남이 추측 못 할 문자열로 변경 권장
 CHROMIUM_PATH = None       # 보통 None으로 두면 playwright가 알아서 찾습니다.
 # ------------------------------------------------------------------------
@@ -65,67 +70,93 @@ def notify(message: str):
     #     s.send_message(msg)
 
 
+def dismiss_notice(page):
+    """첫 화면에 뜨는 공지사항 팝업(notice_bg 반투명 배경)이 클릭을 가로막으므로 치운다."""
+    # 1) '닫기' 류 버튼이 있으면 눌러본다
+    for sel in [
+        "[class*='notice'] a:has-text('닫기')",
+        "[class*='notice'] button:has-text('닫기')",
+        "[class*='notice'] a:has-text('오늘')",
+        "[class*='notice'] [class*='close']",
+    ]:
+        loc = page.locator(sel)
+        try:
+            if loc.count() > 0 and loc.first.is_visible():
+                loc.first.click(timeout=2000, force=True)
+                page.wait_for_timeout(500)
+        except Exception:
+            pass
+    # 2) 그래도 남아 있으면 팝업/배경 요소를 DOM에서 제거
+    try:
+        page.evaluate(
+            """() => document.querySelectorAll(
+                   ".notice_bg, [class*='notice_pop'], [class*='notice_layer'], [id*='notice']"
+               ).forEach(el => el.remove())"""
+        )
+    except Exception as e:
+        print(f"[팝업 제거 실패, 계속 진행] {e}")
+    page.wait_for_timeout(300)
+
+
+def check_facility(page, radio_id: str, alt_keyword: str) -> dict:
+    page.goto(SHOP_URL, wait_until="networkidle", timeout=30000)
+    page.wait_for_timeout(1000)
+    dismiss_notice(page)
+
+    # 1) 시설 선택 (id가 한글이라 속성 선택자 사용). force=True: 혹시 남은 오버레이 무시
+    page.click(f"input[id='{radio_id}']", force=True, timeout=10000)
+    page.wait_for_timeout(1200)
+    dismiss_notice(page)
+
+    # 2) 날짜 선택 (월이 안 맞으면 다음달로 넘기며 최대 6개월 탐색)
+    clicked = False
+    for _ in range(6):
+        day_link = page.locator("a", has_text=re.compile(rf"^\s*{TARGET_DAY}\s*$"))
+        if day_link.count() > 0:
+            day_link.first.click(force=True, timeout=10000)
+            clicked = True
+            break
+        next_btn = page.locator("a[href*='goNextMonth']")
+        if next_btn.count() == 0:
+            break
+        next_btn.first.click(force=True)
+        page.wait_for_timeout(500)
+    if not clicked:
+        return {"error": f"{TARGET_DAY}일 달력 링크를 찾지 못했습니다."}
+
+    page.wait_for_timeout(1500)
+
+    # 3) 자리 아이콘 alt 텍스트로 상태 판별
+    icon_locator = page.locator(f"img[alt*='{alt_keyword}']")
+    alts = [icon_locator.nth(i).get_attribute("alt") for i in range(icon_locator.count())]
+    alts = [a for a in alts if a]
+    if not alts:
+        return {"error": f"'{alt_keyword}' 자리 아이콘을 찾지 못했습니다 (선택이 반영되지 않았을 수 있음)."}
+
+    sold = [a for a in alts if "예약완료" in a]
+    open_sites = [a for a in alts if "예약완료" not in a]
+    return {"total": len(alts), "sold_out": len(sold), "open_sites": open_sites}
+
+
 def check_once() -> dict:
+    results = {}
     with sync_playwright() as p:
         launch_kwargs = {"headless": True}
         if CHROMIUM_PATH:
             launch_kwargs["executable_path"] = CHROMIUM_PATH
         browser = p.chromium.launch(**launch_kwargs)
         page = browser.new_page()
-        page.goto(SHOP_URL, wait_until="networkidle", timeout=30000)
-        page.wait_for_timeout(1000)
-
-        # 1) 시설 선택: 오토캠핑장 라디오 클릭 (id가 한글 그대로라 CSS #id 대신 속성 선택자 사용)
-        page.click(f"input[id='{FACILITY_RADIO_ID}']")
-        page.wait_for_timeout(1200)
-
-        # 2) 날짜 선택: 달력에서 정확히 TARGET_DAY 텍스트인 <a> 클릭
-        #    (월이 안 맞으면 다음달 화살표를 눌러가며 찾음 - 최대 6개월)
-        clicked = False
-        for _ in range(6):
-            day_link = page.locator("a", has_text=re.compile(rf"^\s*{TARGET_DAY}\s*$"))
-            if day_link.count() > 0:
-                day_link.first.click()
-                clicked = True
-                break
-            next_btn = page.locator("a[href*='goNextMonth']")
-            if next_btn.count() == 0:
-                break
-            next_btn.first.click()
-            page.wait_for_timeout(500)
-
-        if not clicked:
-            browser.close()
-            return {"error": f"{TARGET_DAY}일 달력 링크를 찾지 못했습니다."}
-
-        page.wait_for_timeout(1500)
-
-        # 3) 상태 읽기: 오토캠핑 자리 아이콘들의 alt 텍스트 확인
-        #    (이 환경에서 eval_on_selector_all / evaluate 둘 다 내부 오류나 빈 값을
-        #     내는 경우가 있어, 가장 기본적인 Locator API로 하나씩 읽음)
-        icon_locator = page.locator("img[alt*='오토캠핑']")
-        icon_count = icon_locator.count()
-        alts = [icon_locator.nth(i).get_attribute("alt") for i in range(icon_count)]
-        alts = [a for a in alts if a]
-
+        for radio_id, alt_keyword in FACILITIES:
+            try:
+                results[radio_id] = check_facility(page, radio_id, alt_keyword)
+            except Exception as e:
+                results[radio_id] = {"error": f"{type(e).__name__}: {str(e).splitlines()[0]}"}
+                try:
+                    page.screenshot(path=f"error_{radio_id}.png", full_page=True)
+                except Exception:
+                    pass
         browser.close()
-
-        if not alts:
-            return {
-                "error": (
-                    "오토캠핑 자리 아이콘을 하나도 찾지 못했습니다 "
-                    "(날짜/시설 선택이 제대로 반영되지 않았을 수 있습니다)."
-                )
-            }
-
-        sold = [a for a in alts if "예약완료" in a]
-        open_sites = [a for a in alts if a and "예약완료" not in a]
-
-        return {
-            "total": len(alts),
-            "sold_out": len(sold),
-            "open_sites": open_sites,
-        }
+    return results
 
 
 LOG_FILE = Path(__file__).with_name("camp_monitor_log.txt")
@@ -144,25 +175,29 @@ def write_log(line: str):
 
 
 def main():
-    result = check_once()
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    results = check_once()
+    print(json.dumps(results, ensure_ascii=False, indent=2))
 
-    if result.get("error"):
-        # 페이지 구조가 바뀌었거나 일시적 오류 - 알림은 보내지 않고 로그만 남김
-        write_log(f"오류: {result['error']}")
-        return
+    found_lines = []
+    errors = []
+    for name, r in results.items():
+        if r.get("error"):
+            errors.append(f"{name}: {r['error']}")
+            write_log(f"{name} 오류: {r['error']}")
+            continue
+        write_log(f"{name} total={r['total']} sold_out={r['sold_out']} open_sites={r['open_sites']}")
+        if r["open_sites"]:
+            found_lines.append(f"[{name}]")
+            found_lines.extend(r["open_sites"])
 
-    write_log(
-        f"total={result['total']} sold_out={result['sold_out']} "
-        f"open_sites={result['open_sites']}"
-    )
-
-    if result["open_sites"]:
-        msg = "오토캠핑장 자리가 열렸습니다!\n" + "\n".join(result["open_sites"])
-        notify(msg)
+    if found_lines:
+        notify("9/26 캠핑장 자리가 열렸습니다!\n" + "\n".join(found_lines))
         print(">>> 빈자리 발견! 알림을 보냈습니다.")
-    else:
+    elif not errors:
         print("아직 전부 예약완료 상태입니다.")
+
+    # 모든 시설 확인이 실패했을 때만 실패로 종료 (GitHub Actions에서 빨간불로 표시)
+    return 1 if len(errors) == len(results) else 0
 
 
 if __name__ == "__main__":
